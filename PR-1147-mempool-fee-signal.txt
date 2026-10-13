@@ -1,0 +1,766 @@
+Kaspa mempool after IBD, and the fee signal dapps actually use
+13 October 2026. Public note.
+Not posted on kaspanet/rusty-kaspa. This file is the record. The links
+below are the sources. Kaspa Pulse's night count is included because he
+said yes to publishing it, and because his count is the outside check
+on what the chain actually accepted.
+
+Credit
+  The mechanism, the first patch, the decision to drop that patch, and the
+  revised design are atharaldsen's (kaspanet/rusty-kaspa#1146, #1147,
+  comment 6146955360). The Testnet-10 measurements that show the fee
+  estimator eating a dead queue are oskrcl's, on the same issue and pull
+  request. Michael Sutton's cost objection to a full revalidation on every
+  IBD is right, and atharaldsen already accepted it. The part that does not
+  hold is treating the leftover transactions as a minor monitoring quirk.
+
+This file
+  What is wrong, how the node gets there, why a fee-following application
+  on Testnet-10 needs it fixed, what the storm record adds, what atharaldsen
+  proposed after review, and what to do.
+
+
+1. What
+
+A synced, non-mining Kaspa node can keep transactions in its mempool after
+the selected chain has already accepted them. getInfo.mempoolSize stays
+high. getMempoolEntries returns the same ids minute after minute. Blocks
+in the same window are nearly empty. The public indexer says those
+transactions are already accepted, and the node's own block color agrees.
+
+That is issue #1146, opened by oskrcl on 9 October 2026 against a
+Testnet-10 node (rusty-kaspa v2.0.1, docker, --testnet --utxoindex,
+synced, not mining). The same path is still on master at 12db0f35
+(13 October 2026). Pull request #1147 is the attempted fix. It is open.
+Michael Sutton requested changes on 13 October 2026 and wrote that the
+leftovers are "not a real problem except for maybe monitoring tools (and
+perhaps fee esitimation)", with three reasons: a mining node evicts them
+when it builds a template, a full mempool evicts them in favour of
+higher-fee transactions, and everything low-priority expires after 24
+hours. supertypo had already objected to the cost. Both reacted to that
+comment. The review line is "needs more discussion to finalize a solution,
+if at all needed."
+
+atharaldsen's reply, the comment this note is about, drops the original
+patch and proposes telling the mempool about each IBD block body, the same
+way relay already does. He also says he is willing to close the pull
+request and leave #1146 as a known fee-estimation caveat.
+
+The caveat is the wrong outcome. The fee estimate is how a wallet or a
+dapp decides it is close to congestion and raises the fee so a payment
+still gets into a block. On the measured node that signal was about 16
+times the real price while blocks had a handful of transactions in them.
+Consensus was fine. The price the API advertised was not.
+
+
+2. How the leftovers get in, and how they stay
+
+Mined transactions leave the mempool through FlowContext::on_new_block.
+Relay and RPC block submission call it. It calls
+MiningManager::handle_new_block_transactions. For every transaction in the
+block except the coinbase, that function removes the id from the pool,
+removes double-spends of its inputs, and records the id in the accepted
+set.
+
+IBD does not take that path. sync_missing_block_bodies validates the
+bodies straight into consensus. While the node is out of sync, the relay
+flow also skips incoming blocks, so those blocks arrive through IBD too.
+Nothing then tells the mempool which transactions those blocks accepted.
+
+Two different expiry clocks exist, and the fast one never starts for
+these transactions.
+
+  Low-priority transactions are the ones received through P2P. Master
+  sets DEFAULT_TRANSACTION_EXPIRE_INTERVAL_SECONDS to 24 hours, scanned
+  about once a minute, measured in DAA score. The mempool comments say
+  they expire after 24 hours if they were not inserted in a block.
+
+  The accepted-id set expires much faster:
+  DEFAULT_ACCEPTED_TRANSACTION_EXPIRE_INTERVAL_SECONDS is 120. That clock
+  starts only when handle_new_block_transactions records the id. IBD never
+  records it, so a ghost stays in the ready pool on the 24 hour clock.
+  It does not get the 120 second clock.
+
+  High-priority transactions are the ones submitted by RPC. They never
+  expire, and they are the ones the periodic revalidation pass checks.
+  A relayed transaction is low priority, so that pass does not remove it.
+
+A mining node has a second way out. Building a block template submits the
+ready set to consensus. Consensus rejects an already-spent input with
+MissingTxOutpoints. The mining manager then removes that transaction and
+keeps its redeemers. The default template builder allows 5 attempts
+(DEFAULT_MAXIMUM_BUILD_BLOCK_TEMPLATE_ATTEMPTS). Each attempt can select
+about one block of mass. A node that builds templates every block
+therefore clears this residue quickly. A node that never builds a
+template never enters that loop.
+
+oskrcl confirmed both halves on his node. The log has a burst of
+completed IBDs on 9 October 2026, 15:31–15:54 UTC, in the same window as
+the blockCount drop. Across 72 hours of logs that node never requested a
+block template. The verbose fee fields next_block_template_feerate_* sat
+at -1, which is the value the estimator returns when it has no template
+stats.
+
+The mempool is not persisted. A restart empties it. A restart also drops
+every real unconfirmed transaction, so it is an operator reset, not a
+fix, and it hides the bug from the next test.
+
+
+3. Why this is the fee signal, not a side display
+
+getFeeEstimate does not look at the chain. It looks at the ready
+frontier, the set of transactions the mempool still believes it can mine.
+
+Master, mining/src/feerate/mod.rs, at 12db0f35:
+
+  The priority bucket is the feerate for inclusion on the order of one
+  block time. The comment calls it sub-second DAG inclusion. At 10 blocks
+  per second that target is 0.1 seconds. oskrcl's reading labels it
+  "(0.1s)", which matches.
+
+  time = c1 * c2 / feerate^ALPHA + c1
+  ALPHA is 3 (frontier.rs: weight is feerate^alpha with alpha=3).
+  c2 is the total weight of the ready set, the sum of (fee/mass)^3,
+  after the estimator optionally drops a few extreme outliers.
+  c1 is the inclusion interval implied by average mass, block mass, and
+  block rate.
+
+  A higher c2 raises the feerate required to hit 0.1 seconds. Because the
+  weight is cubed, a transaction at 16 times the floor weighs about
+  16^3 = 4096 times a floor-fee transaction. A few high-fee leftovers
+  dominate the priority bucket. The normal bucket is aimed at about 60
+  seconds, so the same weight barely lifts it off the floor.
+
+getInfo.mempoolSize is the transaction-pool count
+(TransactionQuery::TransactionsOnly). Leftovers that were never removed
+are still in that pool, so they count.
+
+The node's own integration guide tells wallets to trust this API.
+docs/toccata-guide.md on the same master commit:
+
+  "If you use the RPC fee estimation API to set your fees (most wallets
+  do), you don't need to change anything."
+  "Exchanges, miners, pools, explorers, wallet operators, and other
+  service providers should test their full infrastructure against
+  Testnet-10" including "fee estimation".
+  "Testing on Testnet-10 is the recommended way to verify that your
+  systems handle the Toccata transaction fields before mainnet
+  activation."
+
+So the documented test is: run the application against Testnet-10 and let
+the fee API tell it what to pay. #1146 is that API, on Testnet-10, lying
+for up to 24 hours after a catch-up.
+
+
+4. The measurement
+
+oskrcl, on #1147, 11 October 2026, same non-mining Testnet-10 node:
+
+  About 21.8k mempool entries.
+  A 300-transaction sample was about 99.7 percent already is_accepted on
+  the indexer, and still listed locally. That is a sample, not a census
+  of all 21.8k. The direction matches the earlier census-style check:
+  on 9 October, 2433 ids were identical across 60 seconds (0 left, 1 new),
+  8 of 8 samples were accepted, and the accepting blocks were blue on
+  that same node, which was ~170k blue scores ahead of them.
+  On 10 October, of 46 entries that survived about 10 minutes, 28 were
+  already accepted. Fresh spam in that later window was 0 of 60 accepted,
+  so the indexer was not simply marking everything accepted.
+
+  Fee estimate on that node: priority bucket 1644 sompi/gram for the 0.1s
+  bucket. A public endpoint at the same time quoted 100, which is the
+  standard floor (DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE is 100_000
+  sompi per kilogram, which is 100 sompi/gram).
+  mempool_ready about 17,738 transactions and 29.3M mass.
+  network_mass_per_second 5,000,000. That is 10 blocks/s times the
+  500,000 compute-mass limit, so the node was estimating against the
+  live mass ceiling.
+  Normal and low buckets sat near 115–197. He described the practical
+  overpay as about 8–15 times (floor about 110 up to 1644).
+
+What 29.3M mass means, against that same 5,000,000 mass per second:
+
+  29.3e6 / 5e6 = 5.86 seconds of backlog.
+  At 10 blocks per second that is about 59 block-times.
+  29.3e6 / 500,000 = 58.6 full blocks of compute mass.
+  29.3e6 / ~1,650 ≈ 17.8k transactions, in line with the ready count,
+  so these are ordinary payment-sized transactions, not huge scripts.
+
+If the 99.7 percent sample holds for the ready set, the live mass is
+about 0.3 percent of 29.3M, roughly 90,000, which is under one block of
+500,000. The chain was not 59 blocks behind. The estimator said it was.
+
+The blocks he counted on 9 October were about 4–6 transactions each,
+with DAA advancing normally. A full block of ordinary signed payments is
+about 304 transactions at about 498,800 of 500,000 compute mass, which
+is about 3,040 to 3,080 inclusions per second at 10 blocks per second.
+That ceiling was measured on Testnet-10 on 7 October 2026 (STP-KAS storm
+record, history/MASTER.md, "the mass ceiling"). Six transactions is
+about 2 percent of a full block. The network was digesting. The mempool
+counter was pinned.
+
+1644 against a floor of 100 is a factor of 16.4. Cubed, that is about
+4,400 times the weight of one minimum-fee transaction. That is why the
+priority bucket moved and the 60-second buckets did not. The bucket an
+application uses when it wants a payment in the next block is the bucket
+the leftovers move. The buckets that look "almost fine" are the ones
+that do not decide urgent inclusion.
+
+
+5. Sutton's three backstops, against that node
+
+Mining templates evict them.
+  True for a node that mines. oskrcl's node did not build a template in
+  72 hours. The nodes a dapp and a public fee endpoint actually query
+  are usually in that class. One template call also only peels off a few
+  block-masses of the highest-fee entries (5 attempts, one block of mass
+  each). A miner clears 20k entries in seconds because it builds a
+  template every block. An RPC node does not start.
+
+A fuller mempool evicts them for higher fees.
+  True at the cap, and the cap is far above this residue. Master sets
+  DEFAULT_MAXIMUM_TRANSACTION_COUNT to 1,000,000 and
+  DEFAULT_MEMPOOL_SIZE_LIMIT to 1,000,000,000 bytes. apply_ram_scale only
+  scales those down, and only down. A pool of 22k does not reach either
+  cap, so nothing is evicted for size.
+  Eviction removes the lowest feerate first. Leftovers from a loaded
+  period are often the high-feerate ones. They are the last to go, and
+  they are exactly the ones that dominate a cubed weight. A new payment
+  at the 100 sompi/gram floor does not push them out. It sits under them,
+  and the priority quote stays high so that the new payment is told to
+  outbid a queue that has already been mined.
+
+24 hour expiry.
+  True for low-priority transactions, and it is the only backstop that
+  runs on the node that has the bug. 24 hours is longer than the
+  Testnet-10 runs used to see whether the network digested a load.
+  The 10 October storm plan ran on the order of 8 hours. The 11 October
+  send window was 5 hours (07:30Z to 12:30Z). A dirty quote that lasts
+  until the next day outlives the experiment. You cannot time "back
+  under a quiet mempool" if the quiet chain still has yesterday's
+  accepted transactions sitting in the pool.
+
+None of the three says the transactions are still pending on the chain.
+They are not. Users of those particular transactions are not stuck.
+That is the scope Sutton is right about. The scope he marks as "maybe"
+is the scope the wallet guide tells every integrator to depend on.
+
+
+6. What the storms add
+
+The storm record is STP-KAS Testnet-10 load from mid September through
+11 October 2026. The map is tn-master, history/MASTER.md, with one page
+per day under history/storms/. It is not a Kaspa consensus change. It is
+evidence about when a fee number is doing real work. Every figure below
+is reported in those files. This note did not re-measure them.
+
+The fee number matters in two places, and only there.
+
+  When blocks are full, fee orders who gets the slot. It does not create
+  slots. The measured ceiling for a signed 1-in/1-out is about 308
+  payments per block and about 3,080 per second. Runs that paid a very
+  high multiple did not get more room. The September round 5 note records
+  a 150 times storm fee as counterproductive, and the write-up's lesson
+  is that very high fees do not buy more capacity. Once blocks are full,
+  a higher fee only moves that sender ahead of a lower fee. That reorder
+  is the whole point of an "important payment" path. It works when the
+  frontier is the live queue. It is a donation when the frontier is
+  already-accepted transactions and the blocks have 4 to 6 payments in
+  them.
+
+  When the pool is actually near its cap, fee decides who is allowed to
+  stay. On 25 September the box node sat near 99,970 entries, evicted
+  30,298 transactions by feerate, and then panicked in
+  validate_and_insert_transaction.rs at 100001 > 100000 because
+  --ram-scale=0.1 had lowered the cap to 100,000 and the insert path
+  asserted instead of rejecting. Operators since then treat
+  getInfo.mempoolSize as the brake: stop feeding a public node before
+  100,000. A count that includes ghosts makes that brake a measure of
+  the wrong set. 22,000 ghosts do not by themselves reach the panic.
+  They do change how close the operator thinks the live pool is, and
+  they can trip a lower pause threshold that was meant for live load.
+
+The same record shows nodes falling behind, which is the entrance to
+this bug. On 9 October the keel node reached 868 seconds of lag at
+15:28 UTC, the same afternoon oskrcl logged his IBD burst at 15:31–15:54
+UTC. Those are different reports about different nodes. Together they
+say catch-up IBD was a normal event on Testnet-10 that day, not an
+exotic failure. A node that catches up is the node whose mempool the
+bug corrupts, and it is often the node an application then uses as
+"synced, so its fee quote is current."
+
+The 11 October storm controller, on our own senders, climbed the rate
+when the mempool was under about 1,500 and the normal quote was under
+160 sompi/gram, and it sat out when the normal quote was above 200.
+Fees on that run were later raised on purpose, from 200/300 to 280/420
+and then to 560/840 sompi/gram, because acceptance and the quote were
+the load signals. A ghost pool of 2,433 (the pinned size in the original
+report) or 21,800 (the 11 October reading) fails those gates while the
+chain is empty. The controller would hold or pay more. The blocks would
+not fill. That is the dapp behaviour this note is about, already wired
+into a Testnet-10 load harness: watch the pool and the quote, raise the
+fee when they say the network is close to full, so the payments that
+matter are not the ones left behind.
+
+Two different failures are easy to mix up, and they should stay separate.
+
+  During several storms a public fee quote stayed at the floor while a
+  private node was busy. That happens when the public node never saw
+  those transactions. Its frontier is honestly small. Following it
+  underpays relative to the private queue.
+
+  #1146 is the opposite error on a node that did see the transactions,
+  mined them via IBD, and forgot to forget them. Following it overpays
+  relative to an empty chain.
+
+  An application that compares two synced nodes can see 100 and 1644 at
+  the same time and has no field that says which frontier is dead.
+  oskrcl's pair of readings is that case.
+
+When the queue was real, the same API did move, and a higher fee did
+buy a faster probe, up to a point.
+
+  25 September, box node n0, --ram-scale=0.1. The public implications
+  note reports fee probes on that node: 1× the floor, p50 7.0 seconds,
+  max 105 seconds; 10×, max 3.7 seconds; 100× no better than 10×.
+  Processed mean was 6,466 tx/s. That counter overstates unique
+  inclusion. The useful part is the probe: paying more helped until it
+  did not. tn-master's 25 September page records the mempool-cap panic
+  and the 30,298 fee evictions on that day.
+
+  1–2 October, same box. The public report says n0's own normal fee
+  estimate peaked at 24,144.8 sompi/gram at 01:51:21 because of that
+  node's own backlog. That is the estimator describing a live queue.
+  It is the behaviour a dapp wants. #1146 is the same field describing
+  a queue that has already been mined.
+
+  The same public report records five public Testnet-10 nodes at
+  07:10 UTC on 2 October holding mempools from 34,684 to 401,448 at
+  the same moment. Mempool size is a property of one node. On 2 and
+  3 October, api.kaspa.org/info/fee-estimate returned 100 sompi/gram
+  on the priority, normal, and low buckets. A quiet mainnet quote is
+  the floor on every bucket. oskrcl's split, priority 1644 with normal
+  and low near 115–197, is not that shape.
+
+
+Kaspa Pulse
+
+Kaspa Pulse (@gokugalax, kaspapulse.com) counted what landed in blocks,
+on his own nodes, and sent the comparison across. His inputs from
+4 October on are listed in tn10-storm-2026-10-10 credits/KASPA-PULSE.md.
+The night files were published with his yes. Two of his results are
+the outside check on this bug.
+
+He does not use mempool size once nodes disagree. His notes for the
+9–10 October night, under "Limits of this count":
+
+  "We count what lands in blocks. What was sent but never accepted is
+  only in your logs."
+  "The mempool on our nodes and yours disagree after 01:30 (about 2,880
+  against about 200). We do not use mempool numbers for any conclusion
+  here."
+
+That is an independent counter throwing out getInfo.mempoolSize because
+two synced views of the same chain did not match. The dapp case is the
+same fact with money on it. If the application raises its fee from one
+node's mempool, it is using the number he refused to conclude from.
+After 01:28 that night the chain was back at about 55 tx/s of base load.
+The mempools still did not agree. A leftover set on one node and a
+small set on another is what #1146 produces, and it is what he measured
+as a reason to ignore the counter.
+
+He also counted the blocks, and the blocks were not full. Same notes:
+highest minute 00:47 UTC was 1,223 tx/s, "what arrived, not a network
+limit. Blocks never filled up." In the 87 minutes above 800 tx/s, blocks
+came at 9.55 per second against 9.93 in quiet minutes, and each of those
+blocks carried 109.6 transactions on average. About 49.7 percent of all
+blocks that night carried only the coinbase. "The network was far from
+full." The chain never stalled: 493 to 716 blocks per minute, 9.92
+blocks per second on average, longest gap 1.13 seconds. 7,541,103
+transactions accepted in blocks from 21:25 to 05:35 UTC, 6,607,409 of
+them in the load window 22:00–01:28 (mean 526.9 tx/s). His question list
+from 4–5 October already asked for confirmation time at the normal fee
+versus 1.5×, and for mempool depth over time. Those are the two series
+a fee-following app needs. The depth series is the one his own later
+count refused to trust.
+
+11 October is the day the fee reading and the chain count can be put
+on one clock, without claiming they are the same node.
+
+  The flat-out run was 07:30–12:33 UTC. Kaspa Pulse's outside count for
+  07:30–12:30, 300 minutes, two nodes, by block time: mean 2,844 tx/s,
+  median 3,055, best minute 3,646 at 11:28 UTC, 51.2 million accepted,
+  163 minutes above 3,000. The run's own chain-count median was 3,107.1
+  and its peak complete minute was 3,583.1. A mirror of his method on
+  the bot side, from 10:48 UTC, read 3,645.9 tx/s at 11:28 on both of
+  its nodes, with 0 disagreements. Base load in these network counts is
+  about 56 tx/s, his figure. Source: tn-master history/storms/2026-10-11.md
+  and the credits page for that day. The per-minute mirror is
+  tn10-storm-2026-10-11 logs/bot/pulse-method-minute.csv.
+
+  oskrcl's fee comment on #1147 was posted at 16:20 UTC the same day,
+  about four hours after the halt at 12:33. His node is not identified
+  as one of the storm nodes. What the two reports say side by side is
+  enough: the chain had been accepting thousands of transactions a
+  second, the senders had stopped, and a synced non-mining node was
+  still quoting a priority fee of 1644 against a mempool whose sampled
+  entries were already accepted. A 24 hour expiry does not give that
+  quote back before the next test. His 9 October IBD burst at
+  15:31–15:54 UTC sits on the same afternoon the storm log records keel
+  at 868 seconds of lag (15:28 UTC). Different nodes. Same kind of
+  catch-up.
+
+A fee that follows Pulse's rule follows the blocks. A fee that follows
+one node's mempool, or one node's priority bucket, follows whatever
+that node failed to forget.
+
+
+7. The comment at #1147, 6146955360
+
+atharaldsen agrees that turning every IBD into a full consensus
+revalidation of the pool is a bad trade. He drops that design. The
+agreement is specific, and it is correct.
+
+supertypo had named the cost: every IBD, including a short catch-up near
+the tip, would revalidate every pooled transaction, tens of thousands on
+a busy node. Sutton added that this maps "any IBD" onto "full mempool
+revalidation" and becomes a new cost an adversary would like. Short
+catch-ups are normal at 10 blocks per second whenever a node briefly
+falls behind. Paying a full pool validation each time is the wrong
+shape. The original pull request should not be merged as it stands.
+
+supertypo also named a real hole in full revalidation. If both a parent
+A and its child B were mined, B can still pass the check, because its
+input is satisfied by A while A is still in the pool. A is then removed
+and its redeemers are kept, so B remains until expiry. Reporting the
+block bodies does not have that hole. handle_new_block_transactions
+removes each non-coinbase transaction by id because it appears in the
+block, and it removes double-spends of that block's inputs. Parent and
+child both leave because both are in the body, independent of which one
+the pool still considers spendable.
+
+His replacement, in that comment:
+
+  After each body chunk in sync_missing_block_bodies has been validated,
+  pass those blocks to handle_new_block_transactions, the same call
+  on_new_block already makes. The work is linear in bodies consensus has
+  just accepted. A peer does not get a second, larger job than the IBD
+  it already caused.
+
+  Skip the call when the mempool and the orphan pool are both empty.
+  The mempool is not persisted, so a full IBD after a restart costs
+  nothing extra.
+
+  Also report the blocks that revalidate_orphans unorphans at the end of
+  IBD. Those are tip blocks that were relayed during the gap. Today they
+  bypass the mempool as well.
+
+  Headers-proof and pruning catch-up replace the UTXO set and do not
+  deliver the bodies below the new pruning point. That path is for a
+  node on the order of a pruning period behind. On the 10 blocks/s
+  parameters the pruning depth is 1,080,000 blocks, which is 30 hours.
+  That is past the 24 hour low-priority expiry, so the next expiry scan
+  clears what remains. He leaves that residual alone. That is a fair
+  split for this pull request.
+
+He keeps Sutton's fourth idea out of this pull request. That idea was to
+revalidate when blocks are not full and the mempool is still not
+clearing. atharaldsen's reason is right: after Toccata a block can be
+under the compute-mass limit while a lane gas limit is what actually
+filled it, or the other way around. "Not full" is a bad predicate.
+"Not clearing" is equally easy to get wrong while a real low-fee backlog
+is waiting. The symptom oskrcl reported (empty-looking blocks, zero
+rotation) is exactly what a safety net should catch, and the way to
+catch it later is to test whether pooled ids are already accepted, not
+to infer acceptance from how full the block looked.
+
+He ends by offering to close the pull request and leave #1146 as a known
+fee-estimation caveat. That offer is polite. The measurements say the
+caveat is the bug.
+
+
+8. What to add
+
+Keep the assertion he already added for oskrcl, and point it at the new
+path. Commit b4df2d8 checks that before reconnect the stale transaction
+is the syncee's only ready transaction (count 1, non-zero mass) and that
+after the post-IBD pass the ready count and mass are both 0. Ready count
+and ready mass are the estimator's inputs. A priority-bucket check
+belongs next to them if it stays cheap: before the catch-up the 0.1
+second feerate is above the floor, after it the feerate is the floor.
+The test should not need a mining template to pass. The non-verbose
+estimate is the one wallets call, and it is the one that does not heal
+the pool as a side effect.
+
+Do not revive full-pool revalidation in order to get that assertion.
+
+State the chained parent-and-child case in the test if a small fixture
+can mine both in one body. The body-reporting path should drop both.
+That is the regression supertypo's review was protecting.
+
+Leave the headers-proof residual documented on the issue in one
+paragraph, as he did, so a later reader does not think every sync shape
+was covered.
+
+A later safety net, separate from this pull request, can scan for pooled
+transactions whose outpoints are already spent in the UTXO set, on a
+slow timer, without tying the scan to "the block looked empty." Lane
+limits make the empty-block trigger unstable. A spent-outpoint check
+does not care which resource filled the block. It is optional. The IBD
+body report is the fix for the path that creates the residue.
+
+The ram-scale panic at 100,001 is a neighbour, not this bug. It should
+stay a reject (RejectMempoolIsFull) instead of an assert. Fixing #1146
+does not fix that assert. Leaving #1146 open does not make the assert
+worse. Operators should keep treating a live mempool near 100,000 on a
+ram-scale 0.1 node as a crash risk.
+
+
+9. Conclusion
+
+The chain is right. The leftovers are not pending payments. A miner that
+builds templates removes them. They do expire, a day later, if nobody
+mines them out.
+
+The fee API is wrong for that whole day on the class of node that serves
+the API: synced, non-mining, after a catch-up IBD. Master builds the
+priority bucket from the ready frontier with a cubed feerate weight, and
+the project tells wallets to follow that bucket. oskrcl measured the
+priority bucket at 1644 sompi/gram against a public floor of 100, with
+about 59 blocks of apparent mass, while blocks carried a handful of
+transactions and almost all of a 300-id sample was already accepted.
+
+That is the signal a dapp uses to decide the network is close to full
+and to raise the fee so its own payments are the ones that get in.
+Raising the fee into a dead frontier does not buy inclusion. It spends
+the fee, and on mainnet that fee is real KAS. Holding the payment back
+because mempoolSize looks pinned stalls the application while the chain
+has room. Testnet-10 is where the guide says to prove this behaviour
+before mainnet. A quote that stays dirty for longer than a storm makes
+that test unreproducible.
+
+Sutton is right that the first patch is the wrong patch. atharaldsen is
+right about the replacement, and right that this is a fee-estimation
+bug. Closing #1146 as a caveat would record the bug and decline to fix
+the path that writes it.
+
+
+10. Advice
+
+For the pull request. Keep #1146 open. Do not merge the full-pool
+revalidation. Do review the design in comment 6146955360: report each
+validated IBD body chunk through handle_new_block_transactions, skip it
+when both pools are empty, and report the blocks unorphaned at the end
+of IBD. Keep the ready-count and ready-mass assertion, retargeted at
+that path. Add the parent-and-child body if the fixture stays small.
+Leave the pruning-point catch-up as the documented residual he described.
+Leave the "blocks look empty" trigger out of this pull request.
+
+For a dapp or a monitor until that ships. Read the fee estimate from a
+node whose recent blocks you also count. A large mempoolSize beside
+blocks of a few transactions is this residue, and the priority bucket on
+that node is not a congestion price. A priority bucket many times the
+floor, with normal buckets near the floor, is the cubed-weight shape of
+the same residue. Cross-check a second node. If one quote is near 100
+and another is an order of magnitude higher, and the chain is not full,
+believe the blocks. Calling the verbose estimate once is not a repair:
+a template build only drops a few block-masses of entries, and the
+non-verbose call drops none. Restarting the node clears the pool because
+the pool is memory only, and it clears the live queue with it.
+
+For a Testnet-10 load run. Keep using mempool size and the fee quote as
+the climb and sit-out signals. After any catch-up on a non-mining node,
+sample a handful of mempool ids against an acceptance source before
+treating a high quote or a flat mempool as load. A plateau that remains
+after senders stop is other live traffic only if those ids are not
+already accepted. The 24 hour expiry is too slow to use as the end of
+a run.
+
+For mainnet. The same master code serves mainnet. A public RPC that
+catch-up-syncs during a fee event will overquote the priority bucket
+until the leftovers age out or some other process builds templates.
+Wallets that follow the API, as the guide tells them to, will overpay.
+Nothing about consensus or about already-accepted history changes.
+The price does.
+
+
+Sources
+
+All of these were opened while this note was written, on 13 October 2026.
+Storm figures are the numbers printed in the linked files. They were not
+re-measured here. Kaspa Pulse's counts are his, published with his yes,
+and credited to him.
+
+The pull request and the issue
+
+  https://github.com/kaspanet/rusty-kaspa/issues/1146
+    oskrcl, opened 9 October 2026. Pinned mempool, empty-looking blocks,
+    sampled ids already accepted and blue on the same node.
+
+  https://github.com/kaspanet/rusty-kaspa/issues/1146#issuecomment-6095689231
+    atharaldsen, 10 October 2026, 08:29 UTC. IBD never calls on_new_block.
+    Only high-priority transactions are revalidated. A node that never
+    builds a template keeps the rest until the 24 hour expiry.
+
+  https://github.com/kaspanet/rusty-kaspa/issues/1146#issuecomment-6102224080
+    oskrcl, 10 October 2026, 21:12 UTC. IBD burst 9 October 15:31-15:54
+    UTC. Zero block-template requests in 72 hours. 28 of 46 entries that
+    survived about 10 minutes were already accepted.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1147
+    atharaldsen. First design in 6c34186. Ready-set assertion in b4df2d8.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1147#issuecomment-6111076516
+    oskrcl, 11 October 2026, 16:20 UTC. About 21.8k entries, about 99.7
+    percent of a 300-sample already accepted, priority 1644 versus 100,
+    ready 17,738 txs / 29.3M mass, network mass 5M/s, normal and low
+    near 115-197, template feerates -1.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1147#issuecomment-6111314427
+    atharaldsen. The ready set is what the estimator reads. He added the
+    ready count and mass assertion.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1147#issuecomment-6124362740
+    supertypo, 12 October 2026. Cost of a full revalidation on every IBD,
+    and the parent/child hole in that design.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1147#issuecomment-6143871731
+    michaelsutton, 13 October 2026, 10:48 UTC. Cost and DoS objection,
+    the three backstops, and the "blocks not full" idea. This is the
+    comment that calls the leftovers a monitoring and maybe fee-estimation
+    issue.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1147#issuecomment-6146955360
+    atharaldsen, 13 October 2026, 13:44 UTC. Drops the full revalidation.
+    Proposes reporting each IBD body through handle_new_block_transactions.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1147#pullrequestreview-5502542535
+    michaelsutton, changes requested. "if at all needed."
+
+Master, kaspanet/rusty-kaspa commit 12db0f35, 13 October 2026
+
+  https://github.com/kaspanet/rusty-kaspa/blob/12db0f35d4bba48cf9962f59cc27d5adb5ae6324/mining/src/mempool/config.rs
+    24 hour low-priority expiry, 60 second scan, 120 second accepted-id
+    expiry, minimum relay 100 sompi/gram, caps of 1,000,000 transactions
+    and 1,000,000,000 bytes, 5 template attempts, ram-scale only scales down.
+
+  https://github.com/kaspanet/rusty-kaspa/blob/12db0f35d4bba48cf9962f59cc27d5adb5ae6324/mining/src/feerate/mod.rs
+    Priority bucket is time_to_feerate of one block time. Weight enters
+    as feerate to the power ALPHA.
+
+  https://github.com/kaspanet/rusty-kaspa/blob/12db0f35d4bba48cf9962f59cc27d5adb5ae6324/mining/src/mempool/model/frontier.rs
+    alpha = 3. The estimator is built from the ready frontier.
+
+  https://github.com/kaspanet/rusty-kaspa/blob/12db0f35d4bba48cf9962f59cc27d5adb5ae6324/mining/src/mempool/handle_new_block_transactions.rs
+    Remove by id, remove double-spends, record the accepted id.
+
+  https://github.com/kaspanet/rusty-kaspa/blob/12db0f35d4bba48cf9962f59cc27d5adb5ae6324/mining/src/manager.rs
+    The non-verbose estimate reads the frontier only. Template build
+    removes missing-outpoint transactions and keeps redeemers.
+
+  https://github.com/kaspanet/rusty-kaspa/blob/12db0f35d4bba48cf9962f59cc27d5adb5ae6324/docs/toccata-guide.md
+    Most wallets should use the fee API. Testnet-10 is where fee
+    estimation is supposed to be tested before mainnet.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/513
+    Michael Sutton, merged August 2024. The fee-estimation API and the
+    mempool sampler this note is describing.
+
+  https://github.com/kaspanet/rusty-kaspa/pull/1004
+    Minimum relay raised to 100 sompi/gram. Merged 15 May 2026.
+
+Parameters used for the 30 hour and 3,080 per second figures. 10 blocks
+per second, 500,000 compute mass per block, pruning depth 1,080,000
+blocks (30 hours), a signed 1-in/1-out around 1,624 mass (about 308 per
+block). These are the live Crescendo parameters, pinned at rusty-kaspa
+v2.1.0 (01b532e8) and still the mainnet shape on 12db0f35. They are not
+a DAGKnight or 100 blocks/s configuration.
+
+  https://github.com/STP-KAS/what-limits-tx-rate
+    The mass ceiling in one page. 7 October samples: about 304 payments,
+    about 498,800 of 500,000 compute mass, about 3,040 per second. A
+    higher fee reordered one sender's own slots. Public mempools climbed
+    into the 90,000s while the chain rate did not move. The same page
+    documents the 100,001 assert under --ram-scale=0.1.
+
+Storm map
+
+  https://github.com/STP-KAS/tn-master
+  https://github.com/STP-KAS/tn-master/blob/main/history/MASTER.md
+  https://github.com/STP-KAS/tn-master/blob/main/history/storms/2026-09-25.md
+    Processed mean 6,466 tx/s, 10-second peak 9,274. Mempool-cap panic.
+    30,298 fee evictions. Public indexer froze at 19:55 UTC.
+
+  https://github.com/STP-KAS/tn-master/blob/main/history/storms/2026-10-07.md
+    The mass-ceiling day. Linked from what-limits-tx-rate.
+
+  https://github.com/STP-KAS/tn-master/blob/main/history/storms/2026-10-09.md
+    Keel lag. Read next to oskrcl's IBD window. Not the same node.
+
+  https://github.com/STP-KAS/tn-master/blob/main/history/storms/2026-10-10.md
+    The 10 October run. Best complete-minute median on the MAX step
+    2,644.9 tx/s. The 3,000 line was not met. The plan window is about
+    8 hours, shorter than the 24 hour expiry.
+
+  https://github.com/STP-KAS/tn-master/blob/main/history/storms/2026-10-11.md
+    Flat-out run, 07:30-12:33 UTC. Halted at 12:33. Network unique
+    accepted: peak complete minute 3,583.1 at 11:28 UTC, mean 2,833.1,
+    median 3,107.1. Kaspa Pulse's outside count is on this page.
+
+  https://github.com/STP-KAS/tn10-storm-2026-10-01/blob/main/TN10-STORMS-MAINNET-IMPLICATIONS-2026-10-04.md
+    25 September probes: 1x p50 7.0 seconds, max 105 seconds; 10x max
+    3.7 seconds; 100x no better than 10x. Panic at 21:12, 100001 > 100000.
+    1-2 October: n0 normal fee estimate peaked at 24,144.8 sompi/gram.
+    Public mempools 34,684 to 401,448 at 07:10 UTC on 2 October.
+    Mainnet api.kaspa.org fee estimate at 100 on every bucket, 2 and
+    3 October.
+
+  https://github.com/kaspanet/rusty-kaspa/blob/01b532e8b553523216471682649693af92f0fd16/mining/src/mempool/config.rs
+    The v2.1.0 pin of the same fee constant, cited by that report.
+
+Kaspa Pulse
+
+  https://x.com/gokugalax
+  https://kaspapulse.com
+
+  https://github.com/STP-KAS/tn10-storm-2026-10-10/blob/main/credits/KASPA-PULSE.md
+    Every input from 4 October on, including the 1x versus 1.5x fee
+    question, mempool depth over time, and the 9-10 October night count.
+    Published with his yes.
+
+  https://github.com/STP-KAS/tn10-storm-2026-10-10/blob/main/credits/kaspa-pulse/2026-10-09-night/README.md
+  https://github.com/STP-KAS/tn10-storm-2026-10-10/blob/main/credits/kaspa-pulse/2026-10-09-night/tn10-2026-10-09-2125-0535-notes.txt
+  https://github.com/STP-KAS/tn10-storm-2026-10-10/blob/main/credits/kaspa-pulse/2026-10-09-night/tn10-2026-10-09-2125-0535-accepted.csv
+    His notes and the 490-minute count. 7,541,103 accepted. Peak minute
+    1,223 tx/s. Blocks not full. Mempool 2,880 versus 200 after 01:30,
+    unused for any conclusion. His header still says the notes were
+    private until a yes. The directory README records that yes.
+
+  https://github.com/STP-KAS/tn10-storm-2026-10-04-questions/blob/main/plan/PULSE-README.md
+    The questions and the method: confirmation time at normal fee versus
+    1.5x, fixed steps, submitted and accepted kept apart.
+
+  https://github.com/STP-KAS/tn-master/blob/main/credits/kaspa-pulse/2026-10-11/README.md
+  https://github.com/STP-KAS/tn10-storm-2026-10-11/blob/main/logs/bot/pulse-method-minute.csv
+    11 October outside count and the per-minute mirror. Mean 2,844,
+    median 3,055, best minute 3,646 at 11:28 UTC, 51.2 million accepted,
+    163 minutes above 3,000. Posted with stp's go-ahead the same day.
+
+11 October controller. The public run page is
+https://github.com/STP-KAS/tn10-storm-2026-10-11
+Send window 07:30-12:33 UTC. The harness climbed while the mempool was
+under about 1,500 and the normal quote was under 160 sompi/gram, and it
+sat out when the normal quote was above 200. The fee pair on that run
+moved 200/300, then 280/420, then 560/840 sompi/gram on purpose. Those
+steps are the harness, not Kaspa node policy. They are in this note
+because they are the behaviour the issue is about: move the fee when
+the quote and the pool say the network is loading up.
+
+One local run is deliberately not used as fee-separation evidence. The
+dedicated one-wallet report paid 100, 200, 500, and 1000 sompi/gram and
+recorded inclusion p50 around 46-53 seconds for every tier, with public
+mempools in the tens to a few hundred. Disconnects and sign timeouts
+dominated. It is mentioned so this note does not claim a measurement it
+does not have. The fee argument rests on oskrcl's quote, the estimator
+on master, Pulse's block counts, and the days when a real backlog did
+move the quote.
